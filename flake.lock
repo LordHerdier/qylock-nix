@@ -16,9 +16,26 @@
         "type": "github"
       }
     },
+    "qylock-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775163206,
+        "narHash": "sha256-KxZ2NKHhMS+2WTY1FKO6zBvc/iZQbOaI78GcoXEi7Iw=",
+        "owner": "Darkkal44",
+        "repo": "qylock",
+        "rev": "5cdf5cf25fc8d6b4f77342d0857d3bccb59b6707",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Darkkal44",
+        "repo": "qylock",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "qylock-src": "qylock-src"
       }
     }
   },

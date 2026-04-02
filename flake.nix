@@ -34,7 +34,7 @@
         # A store path containing:
         #   lock_shell.qml   — QML entry point for the Quickshell lockscreen
         #   shim/            — SddmShim.qml (mocks SDDM globals for qs)
-        #   imports/         — Qt5→Qt6 compat shims (QtGraphicalEffects, QtMultimedia)
+        #   imports/         — SddmComponents shim (TextConstants, LayoutMirroring)
         #   themes_link/     — symlink into the flake source themes/ directory
         qylockShell = pkgs.runCommand "qylock-shell" { } ''
           mkdir -p $out
@@ -43,37 +43,21 @@
             ${self}/quickshell-lockscreen/shim $out/shim
           cp -r --no-preserve=mode,ownership \
             ${self}/quickshell-lockscreen/imports $out/imports
-
-          # Copy themes and apply Qt5→Qt6 patches.  The Video→QylockVideo rename is
-          # intentionally omitted: Video.qml in the imports shim handles Video {} in
-          # the Quickshell context without needing a rename.
-          cp -r --no-preserve=mode,ownership ${self}/themes $out/themes_link
-          find $out/themes_link -name "*.qml" -exec \
-            sed -i \
-              -e 's/import QtGraphicalEffects 1\.15/import Qt5Compat.GraphicalEffects/g' \
-              -e 's/import QtMultimedia 5\.15/import QtMultimedia/g' \
-              -e 's/loops: MediaPlayer\.Infinite/loops: -1/g' \
-              -e 's/VideoOutput\.PreserveAspectCrop/2/g' \
-              -e 's/VideoOutput\.PreserveAspectFit/1/g' \
-              -e 's/VideoOutput\.Stretch/0/g' \
-              -e 's/onLoginFailed:/function onLoginFailed()/g' \
-            {} +
+          cp -r --no-preserve=mode,ownership \
+            ${self}/themes $out/themes_link
         '';
 
         # ── qylock-lock script ────────────────────────────────────────────────
         # Wraps `quickshell` with the correct QML_IMPORT_PATH so that:
-        #   • Real Qt6 modules (qtmultimedia, qt5compat) are found first.
-        #   • The local compat shims are appended as a fallback.
+        #   • SddmComponents shim is found (provides TextConstants etc. to themes)
+        #   • Qt5Compat.GraphicalEffects is found (qt5compat)
+        #   • QtMultimedia is found (qtmultimedia)
         # The theme name is baked in at build time; users can override at runtime
         # by passing a different QS_THEME value before calling the script.
         mkLockScript =
           theme:
           pkgs.writeShellScriptBin "qylock-lock" ''
-            # Real Qt6 modules first so shims don't shadow them (e.g. QtMultimedia).
-            # qt5compat provides Qt5Compat.GraphicalEffects; our shims re-expose it
-            # as the legacy QtGraphicalEffects 1.15 import name.
-            # Shims first — see comment in devShell for rationale.
-            export QML_IMPORT_PATH="${qylockShell}/imports:${pkgs.qt6.qtmultimedia}/lib/qt-6/qml:${pkgs.kdePackages.qt5compat}/lib/qt-6/qml''${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
+            export QML_IMPORT_PATH="${qylockShell}/imports:${pkgs.kdePackages.qt5compat}/lib/qt-6/qml:${pkgs.qt6.qtmultimedia}/lib/qt-6/qml''${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
             export QML2_IMPORT_PATH="$QML_IMPORT_PATH"
             export QML_XHR_ALLOW_FILE_READ=1
             export QS_THEME="${theme}"
@@ -81,42 +65,11 @@
           '';
 
         # ── SDDM theme package ────────────────────────────────────────────────
-        # Installs a qylock theme under $out/share/sddm/themes/<leaf> and applies
-        # all patches needed to make Qt5-targeting QML run under SDDM's Qt6 greeter.
-        #
-        # Why patches instead of QML_IMPORT_PATH?
-        #   SDDM's greeter does not honour QML_IMPORT_PATH from the environment, so
-        #   we cannot inject shim modules via the search path.  Dropping local
-        #   component files into the theme root is the only reliable mechanism —
-        #   QML resolves bare type names against the directory of the importing file
-        #   before searching the module path.
-        #
-        # Patches applied (via sed, in-place on the copied theme):
-        #   • QtGraphicalEffects 1.15  → Qt5Compat.GraphicalEffects
-        #   • QtMultimedia 5.15        → QtMultimedia  (Qt6 bare import)
-        #   • loops: MediaPlayer.Infinite → loops: -1
-        #       MediaPlayer.Infinite is an enum on the real Qt module type; local
-        #       shim components don't expose type-level enums, so we inline the
-        #       value (-1 is Qt's universal "loop forever" sentinel).
-        #   • VideoOutput.PreserveAspectCrop/Fit/Stretch → integer literals
-        #       Same reason: VideoOutput.qml is a local shim, not a real module,
-        #       so type-level enum references like VideoOutput.PreserveAspectCrop
-        #       would be unresolved.  2/1/0 match Qt6's VideoOutput enum values.
-        #   • Video { → QylockVideo {
-        #       The bare name "Video" is exported by the real QtMultimedia module,
-        #       which takes precedence over a local Video.qml shim when
-        #       `import QtMultimedia` is in scope.  Renaming to QylockVideo ensures
-        #       our shim (copied as QylockVideo.qml) is always used.
-        #   • Connections { onFoo: } → Connections { function onFoo() {} }
-        #       Qt6 deprecation; becomes a hard error in strict mode.
-        #
-        # Shims copied into the theme root:
-        #   QylockVideo.qml  — wraps Qt6 MediaPlayer + VideoOutput for themes using
-        #                       the Video {} convenience element (renamed to avoid
-        #                       shadowing by the real QtMultimedia Video type)
-        #   MediaPlayer.qml  — thin shim so themes referencing MediaPlayer directly
-        #                       resolve the type without an explicit module import
-        #   VideoOutput.qml  — same for VideoOutput
+        # Installs a qylock theme under $out/share/sddm/themes/<leaf>.
+        # Themes use Qt6-native imports directly (Qt5Compat.GraphicalEffects,
+        # QtMultimedia) so no patching or shim injection is required.  The
+        # qt5compat and qtmultimedia packages are added to the greeter environment
+        # by nixos.nix.
         mkSddmThemePkg =
           themePath: extraFonts:
           let
@@ -127,25 +80,6 @@
             mkdir -p $out/share/sddm/themes
             cp -r --no-preserve=mode,ownership \
               ${self}/themes/${themePath} $out/share/sddm/themes/
-
-            find $out/share/sddm/themes -name "*.qml" -exec \
-              sed -i \
-                -e 's/import QtGraphicalEffects 1\.15/import Qt5Compat.GraphicalEffects/g' \
-                -e 's/import QtMultimedia 5\.15/import QtMultimedia/g' \
-                -e 's/loops: MediaPlayer\.Infinite/loops: -1/g' \
-                -e 's/VideoOutput\.PreserveAspectCrop/2/g' \
-                -e 's/VideoOutput\.PreserveAspectFit/1/g' \
-                -e 's/VideoOutput\.Stretch/0/g' \
-                -e 's/\bVideo {/QylockVideo {/g' \
-                -e 's/onLoginFailed:/function onLoginFailed()/g' \
-              {} +
-
-            cp ${self}/quickshell-lockscreen/imports/QtMultimedia/VideoSddm.qml \
-              $out/share/sddm/themes/${themeLeaf}/QylockVideo.qml
-            cp ${self}/quickshell-lockscreen/imports/QtMultimedia/MediaPlayerShim.qml \
-              $out/share/sddm/themes/${themeLeaf}/MediaPlayer.qml
-            cp ${self}/quickshell-lockscreen/imports/QtMultimedia/VideoOutputShim.qml \
-              $out/share/sddm/themes/${themeLeaf}/VideoOutput.qml
 
             ${pkgs.lib.concatMapStrings (font: ''
               mkdir -p "$out/share/sddm/themes/${themeLeaf}/font"
@@ -205,35 +139,22 @@
       devShells = forEachSystem (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
-            kdePackages.sddm       # sddm-greeter-qt6 test binary
-            kdePackages.qt5compat  # Qt5Compat.GraphicalEffects compat layer
-            qt6.qtmultimedia       # QtMultimedia (required by video themes)
-            qt6.qtdeclarative      # QtQuick / QML engine
-            qt6.qttools            # qmllint, qmlformat
-            quickshell             # Quickshell lockscreen runner
-            fzf                    # used by sddm.sh / quickshell.sh installers
+            kdePackages.sddm # sddm-greeter-qt6 test binary
+            kdePackages.qt5compat # Qt5Compat.GraphicalEffects
+            qt6.qtmultimedia # QtMultimedia (required by video themes)
+            qt6.qtdeclarative # QtQuick / QML engine
+            qt6.qttools # qmllint, qmlformat
+            quickshell # Quickshell lockscreen runner
+            fzf # used by sddm.sh / quickshell.sh installers
           ];
 
           shellHook = ''
-            # Real Qt6 modules come first so the shims don't shadow them.
-            # qt5compat provides Qt5Compat.GraphicalEffects; the local imports/
-            # directory re-exposes it under the legacy QtGraphicalEffects 1.15 name.
-            # Shims come FIRST so our Video.qml (which uses Quickshell.shellDir for
-            # explicit path resolution) takes priority over Qt6's real Video.qml.
-            # The shim files internally use `import QtMultimedia 6.0 as Native`;
-            # since the shim module is registered at version 5.15, a 6.0 request
-            # falls through to the real Qt6 module — no circular dependency.
-            export QML_IMPORT_PATH="$PWD/quickshell-lockscreen/imports:${pkgs.qt6.qtmultimedia}/lib/qt-6/qml:${pkgs.kdePackages.qt5compat}/lib/qt-6/qml:$QML_IMPORT_PATH"
+            export QML_IMPORT_PATH="$PWD/quickshell-lockscreen/imports:${pkgs.kdePackages.qt5compat}/lib/qt-6/qml:${pkgs.qt6.qtmultimedia}/lib/qt-6/qml''${QML_IMPORT_PATH:+:$QML_IMPORT_PATH}"
             export QML_XHR_ALLOW_FILE_READ=1
 
             # ── testTheme <theme-path> [font-file ...] ──────────────────────
-            # Applies the same Qt5→Qt6 patches and shim copies that mkSddmThemePkg
-            # performs at build time, but targets a disposable temp directory so the
-            # source tree is never touched.  This lets you test the exact post-patch
-            # state without running a full `nix build`.
-            #
-            # Optional extra arguments are font files to drop into the theme's
-            # font/ directory, mirroring the sddmThemeFonts Nix option.
+            # Copies a theme into a disposable temp directory, optionally
+            # injects font files, then launches sddm-greeter-qt6 in test mode.
             #
             # Usage:
             #   testTheme Genshin
@@ -251,26 +172,6 @@
               echo "  Copying themes/$theme → $tmp/$leaf"
               cp -r "$PWD/themes/$theme" "$tmp/"
 
-              echo "  Applying Qt5→Qt6 patches..."
-              find "$tmp/$leaf" -name "*.qml" -exec sed -i \
-                -e 's/import QtGraphicalEffects 1\.15/import Qt5Compat.GraphicalEffects/g' \
-                -e 's/import QtMultimedia 5\.15/import QtMultimedia/g' \
-                -e 's/loops: MediaPlayer\.Infinite/loops: -1/g' \
-                -e 's/VideoOutput\.PreserveAspectCrop/2/g' \
-                -e 's/VideoOutput\.PreserveAspectFit/1/g' \
-                -e 's/VideoOutput\.Stretch/0/g' \
-                -e 's/\bVideo {/QylockVideo {/g' \
-                -e 's/onLoginFailed:/function onLoginFailed()/g' \
-              {} +
-
-              echo "  Copying QtMultimedia shims..."
-              cp quickshell-lockscreen/imports/QtMultimedia/VideoSddm.qml \
-                "$tmp/$leaf/QylockVideo.qml"
-              cp quickshell-lockscreen/imports/QtMultimedia/MediaPlayerShim.qml \
-                "$tmp/$leaf/MediaPlayer.qml"
-              cp quickshell-lockscreen/imports/QtMultimedia/VideoOutputShim.qml \
-                "$tmp/$leaf/VideoOutput.qml"
-
               if [[ $# -gt 0 ]]; then
                 echo "  Copying fonts..."
                 mkdir -p "$tmp/$leaf/font"
@@ -286,9 +187,8 @@
             }
 
             # ── testLockscreen [theme-path] ──────────────────────────────────
-            # Applies the same Qt5→Qt6 patches that qylockShell performs at build
-            # time into a temp directory, symlinks it as themes_link, then launches
-            # the Quickshell lockscreen against it.  Cleans up on exit.
+            # Points themes_link at the local themes/ directory and launches
+            # the Quickshell lockscreen.  Restores the previous symlink on exit.
             #
             # Usage:
             #   testLockscreen
@@ -296,52 +196,35 @@
             #   testLockscreen tui/Crimson
             testLockscreen() {
               local theme="''${1:-Genshin}"
-              local tmp
-              tmp=$(mktemp -d --suffix=-qylock-qs-test)
 
-              echo "  Patching themes → $tmp/themes_link ..."
-              cp -r "$PWD/themes" "$tmp/themes_link"
-              find "$tmp/themes_link" -name "*.qml" -exec sed -i \
-                -e 's/import QtGraphicalEffects 1\.15/import Qt5Compat.GraphicalEffects/g' \
-                -e 's/import QtMultimedia 5\.15/import QtMultimedia/g' \
-                -e 's/loops: MediaPlayer\.Infinite/loops: -1/g' \
-                -e 's/VideoOutput\.PreserveAspectCrop/2/g' \
-                -e 's/VideoOutput\.PreserveAspectFit/1/g' \
-                -e 's/VideoOutput\.Stretch/0/g' \
-                -e 's/onLoginFailed:/function onLoginFailed()/g' \
-              {} +
-
-              # Point the lockscreen at the patched themes via a temp symlink.
               local link="$PWD/quickshell-lockscreen/themes_link"
               local prev_link
               [[ -L "$link" ]] && prev_link=$(readlink "$link")
-              ln -sfn "$tmp/themes_link" "$link"
+              ln -sfn "$PWD/themes" "$link"
 
               echo "  Launching Quickshell lockscreen (QS_THEME=$theme)..."
               QS_THEME="$theme" quickshell -p "$PWD/quickshell-lockscreen/lock_shell.qml"
 
-              # Restore previous symlink (or remove if there wasn't one).
               if [[ -n "''${prev_link:-}" ]]; then
                 ln -sfn "$prev_link" "$link"
               else
                 rm -f "$link"
               fi
-              rm -rf "$tmp"
             }
 
             echo "qylock dev shell"
             echo ""
-            echo "  Test a patched SDDM theme (mirrors the Nix build):"
+            echo "  Test an SDDM theme:"
             echo "    testTheme Genshin"
             echo "    testTheme Genshin ~/fonts/zhcn.ttf"
             echo "    testTheme cozytile/Cozy"
             echo ""
-            echo "  Test the Quickshell lockscreen (mirrors the Nix build):"
+            echo "  Test the Quickshell lockscreen:"
             echo "    testLockscreen Genshin"
             echo "    testLockscreen tui/Crimson"
             echo ""
-            echo "  Test an unpatched theme directly (source tree):"
-            echo "    sddm-greeter-qt6 --test-mode --theme \$PWD/themes/<n>"
+            echo "  Test a theme directly (source tree):"
+            echo "    sddm-greeter-qt6 --test-mode --theme \$PWD/themes/<name>"
             echo ""
           '';
         };
